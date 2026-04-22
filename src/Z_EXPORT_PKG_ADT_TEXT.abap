@@ -23,14 +23,13 @@ TYPES tt_progname TYPE STANDARD TABLE OF progname WITH DEFAULT KEY.
 TYPES: BEGIN OF ty_log,
          status   TYPE c LENGTH 1,
          object   TYPE trobjtype,
-         obj_name TYPE sobj_name,
+         obj_name TYPE string,
          message  TYPE string,
        END OF ty_log.
 TYPES tt_log TYPE STANDARD TABLE OF ty_log WITH DEFAULT KEY.
 
 TYPES: BEGIN OF ty_enlfdir,
          funcname TYPE rs38l_fnam,
-         include  TYPE progname,
        END OF ty_enlfdir.
 TYPES tt_enlfdir TYPE STANDARD TABLE OF ty_enlfdir WITH DEFAULT KEY.
 
@@ -55,13 +54,15 @@ CLASS lcl_text IMPLEMENTATION.
 
   METHOD source_to_string.
     DATA lv_line TYPE char255.
+    DATA lv_text_line TYPE string.
 
     CLEAR rv_text.
 
     LOOP AT it_source INTO lv_line.
+      lv_text_line = lv_line.
       append_line(
         EXPORTING
-          iv_line = lv_line
+          iv_line = lv_text_line
         CHANGING
           cv_text = rv_text ).
     ENDLOOP.
@@ -117,19 +118,19 @@ CLASS lcl_logger DEFINITION.
   PUBLIC SECTION.
     METHODS add_success
       IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE sobj_name
+                iv_name    TYPE string
                 iv_message TYPE string.
     METHODS add_warning
       IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE sobj_name
+                iv_name    TYPE string
                 iv_message TYPE string.
     METHODS add_error
       IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE sobj_name
+                iv_name    TYPE string
                 iv_message TYPE string.
     METHODS add_info
       IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE sobj_name
+                iv_name    TYPE string
                 iv_message TYPE string.
     METHODS to_string
       RETURNING VALUE(rv_text) TYPE string.
@@ -144,7 +145,7 @@ CLASS lcl_logger DEFINITION.
     METHODS add_entry
       IMPORTING iv_status  TYPE c
                 iv_object  TYPE trobjtype
-                iv_name    TYPE sobj_name
+                iv_name    TYPE string
                 iv_message TYPE string.
 ENDCLASS.
 
@@ -210,6 +211,7 @@ CLASS lcl_logger IMPLEMENTATION.
   METHOD to_string.
     DATA ls_log TYPE ty_log.
     DATA lv_line TYPE string.
+    DATA lv_value TYPE string.
 
     CLEAR rv_text.
 
@@ -232,6 +234,7 @@ CLASS lcl_logger IMPLEMENTATION.
 
   METHOD summary_to_string.
     DATA lv_line TYPE string.
+    DATA lv_value TYPE string.
 
     CLEAR rv_text.
 
@@ -243,7 +246,8 @@ CLASS lcl_logger IMPLEMENTATION.
         cv_text = rv_text ).
 
     CLEAR lv_line.
-    CONCATENATE 'Successful exports:' mv_success INTO lv_line SEPARATED BY space.
+    WRITE mv_success TO lv_value.
+    CONCATENATE 'Successful exports:' lv_value INTO lv_line SEPARATED BY space.
     lcl_text=>append_line(
       EXPORTING
         iv_line = lv_line
@@ -251,7 +255,8 @@ CLASS lcl_logger IMPLEMENTATION.
         cv_text = rv_text ).
 
     CLEAR lv_line.
-    CONCATENATE 'Warnings:' mv_warning INTO lv_line SEPARATED BY space.
+    WRITE mv_warning TO lv_value.
+    CONCATENATE 'Warnings:' lv_value INTO lv_line SEPARATED BY space.
     lcl_text=>append_line(
       EXPORTING
         iv_line = lv_line
@@ -259,7 +264,8 @@ CLASS lcl_logger IMPLEMENTATION.
         cv_text = rv_text ).
 
     CLEAR lv_line.
-    CONCATENATE 'Errors:' mv_error INTO lv_line SEPARATED BY space.
+    WRITE mv_error TO lv_value.
+    CONCATENATE 'Errors:' lv_value INTO lv_line SEPARATED BY space.
     lcl_text=>append_line(
       EXPORTING
         iv_line = lv_line
@@ -267,7 +273,8 @@ CLASS lcl_logger IMPLEMENTATION.
         cv_text = rv_text ).
 
     CLEAR lv_line.
-    CONCATENATE 'Info:' mv_info INTO lv_line SEPARATED BY space.
+    WRITE mv_info TO lv_value.
+    CONCATENATE 'Info:' lv_value INTO lv_line SEPARATED BY space.
     lcl_text=>append_line(
       EXPORTING
         iv_line = lv_line
@@ -359,6 +366,7 @@ CLASS lcl_ddic_exporter IMPLEMENTATION.
     DATA lt_dd17v TYPE STANDARD TABLE OF dd17v WITH DEFAULT KEY.
     DATA ls_dd17v TYPE dd17v.
     DATA lv_line  TYPE string.
+    DATA lv_value TYPE string.
 
     CLEAR ev_text.
     CLEAR ev_found.
@@ -428,7 +436,6 @@ CLASS lcl_ddic_exporter IMPLEMENTATION.
 
     CLEAR lv_line.
     CONCATENATE 'BUFFERED:' ls_dd09l-bufallow
-                'BUFFERING TYPE:' ls_dd09l-buftype
                 'LOGGING:' ls_dd09l-protokoll
            INTO lv_line
            SEPARATED BY space.
@@ -446,7 +453,8 @@ CLASS lcl_ddic_exporter IMPLEMENTATION.
 
     LOOP AT lt_dd03p INTO ls_dd03p.
       CLEAR lv_line.
-      CONCATENATE ls_dd03p-position
+      WRITE ls_dd03p-position TO lv_value.
+      CONCATENATE lv_value
                   ls_dd03p-keyflag
                   ls_dd03p-fieldname
                   ls_dd03p-rollname
@@ -486,10 +494,11 @@ CLASS lcl_ddic_exporter IMPLEMENTATION.
 
       LOOP AT lt_dd17v INTO ls_dd17v.
         CLEAR lv_line.
+        WRITE ls_dd17v-position TO lv_value.
         CONCATENATE 'INDEX FIELD:'
                     ls_dd17v-indexname
                     ls_dd17v-fieldname
-                    ls_dd17v-position
+                    lv_value
                INTO lv_line
                SEPARATED BY space.
         lcl_text=>append_line(
@@ -599,8 +608,9 @@ CLASS lcl_ddic_exporter IMPLEMENTATION.
 
       LOOP AT lt_dd26v INTO ls_dd26v.
         CLEAR lv_line.
+        WRITE ls_dd26v-tabpos TO lv_value.
         CONCATENATE ls_dd26v-tabname
-                    ls_dd26v-tabpos
+                    lv_value
                INTO lv_line
                SEPARATED BY space.
         lcl_text=>append_line(
@@ -884,7 +894,7 @@ CLASS lcl_exporter IMPLEMENTATION.
     ENDLOOP.
 
     CLEAR lt_enlfdir.
-    SELECT funcname include
+    SELECT funcname
       FROM enlfdir
       INTO TABLE lt_enlfdir
       WHERE area = iv_fugr.
@@ -900,10 +910,7 @@ CLASS lcl_exporter IMPLEMENTATION.
 
       LOOP AT lt_enlfdir INTO ls_enlfdir.
         CLEAR lv_line.
-        CONCATENATE ls_enlfdir-funcname
-                    ls_enlfdir-include
-               INTO lv_line
-               SEPARATED BY space.
+        lv_line = ls_enlfdir-funcname.
         lcl_text=>append_line(
           EXPORTING
             iv_line = lv_line
@@ -994,21 +1001,32 @@ CLASS lcl_exporter IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD export_object.
+    DATA lv_progname TYPE progname.
+    DATA lv_class    TYPE seoclsname.
+    DATA lv_fugr     TYPE rs38l_area.
+    DATA lv_tabname  TYPE tabname.
+    DATA lv_viewname TYPE tabname.
+
     CASE is_tadir-object.
       WHEN 'PROG'.
-        export_prog( is_tadir-obj_name ).
+        lv_progname = is_tadir-obj_name.
+        export_prog( lv_progname ).
 
       WHEN 'CLAS'.
-        export_class( is_tadir-obj_name ).
+        lv_class = is_tadir-obj_name.
+        export_class( lv_class ).
 
       WHEN 'FUGR'.
-        export_fugr( is_tadir-obj_name ).
+        lv_fugr = is_tadir-obj_name.
+        export_fugr( lv_fugr ).
 
       WHEN 'TABL'.
-        export_table( is_tadir-obj_name ).
+        lv_tabname = is_tadir-obj_name.
+        export_table( lv_tabname ).
 
       WHEN 'VIEW'.
-        export_view( is_tadir-obj_name ).
+        lv_viewname = is_tadir-obj_name.
+        export_view( lv_viewname ).
 
       WHEN 'INTF' OR 'DDLS' OR 'ENHO' OR 'ENHS' OR 'SXSD' OR 'SXCI'.
         mo_log->add_info(
@@ -1041,6 +1059,8 @@ START-OF-SELECTION.
   DATA lv_index TYPE i.
   DATA lv_pct TYPE i.
   DATA lv_text TYPE string.
+  DATA lv_index_text TYPE string.
+  DATA lv_total_text TYPE string.
 
   CREATE OBJECT lo_zip.
   CREATE OBJECT lo_source.
@@ -1072,14 +1092,16 @@ START-OF-SELECTION.
 
     IF lv_total > 0.
       lv_pct = lv_index * 100 / lv_total.
+      WRITE lv_index TO lv_index_text.
+      WRITE lv_total TO lv_total_text.
       CLEAR lv_text.
       CONCATENATE 'Exporting'
                   ls_tadir-object
                   ls_tadir-obj_name
                   '('
-                  lv_index
+                  lv_index_text
                   '/'
-                  lv_total
+                  lv_total_text
                   ')'
              INTO lv_text
              SEPARATED BY space.
