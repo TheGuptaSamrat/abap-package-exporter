@@ -2,6 +2,15 @@
 
 ABAP utility report for exporting repository objects from an SAP package into a ZIP file with a structure that is easier to inspect outside the SAP system.
 
+It is designed as a conservative, SAP_BASIS 7.51-compatible report for teams that want a readable text export without depending on newer ADT-only APIs or abapGit internals.
+
+## Highlights
+
+- Preserves repository source in separate ZIP entries instead of flattening everything into one text file
+- Handles report includes, class-pool parts, and function group includes more safely
+- Adds export logging and summary output for partial failures and skipped object types
+- Produces a ZIP layout that is easier to inspect, compare, and version
+
 ## What it exports
 
 - Programs (`PROG`) with main program and includes
@@ -15,6 +24,7 @@ ABAP utility report for exporting repository objects from an SAP package into a 
 - Targeted for `SAP_BASIS 7.51`
 - Uses conservative ABAP syntax
 - Avoids modern syntax that is risky on older systems
+- Keeps `GUI_DOWNLOAD` for simple front-end ZIP download
 
 ## Repository layout
 
@@ -52,8 +62,18 @@ logs/export_summary.txt
    - `P_PACK` = package name
    - `P_PATH` = local ZIP target path
 
+## Current scope
+
+- Supported export types: `PROG`, `CLAS`, `FUGR`, `TABL`, `VIEW`
+- Logged but not exported in this version: `INTF`, `DDLS`, enhancements, and other unsupported repository object types
+
+## Review and rationale
+
+The refactoring notes behind this version are documented in [`docs/REVIEW_NOTES.md`](./docs/REVIEW_NOTES.md). They explain the gaps in the original implementation and the conservative improvements made here.
+
 ## Notes
 
 - `GUI_DOWNLOAD` means the report is intended for dialog execution, not background mode.
 - Unsupported package object types are logged so gaps are visible during export.
 - CDS views, interfaces, and enhancements are intentionally not force-exported by unreliable assumptions in this version.
+- The current selection reads only objects directly assigned to the chosen package, not the full subpackage tree.
