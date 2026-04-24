@@ -1,79 +1,63 @@
-# ABAP Package Exporter
+# ABAP Package Exporter (Direct Folder Download)
 
-ABAP utility report for exporting repository objects from an SAP package into a ZIP file with a structure that is easier to inspect outside the SAP system.
+ABAP utility report for exporting repository objects from an SAP package directly into a local folder structure. This version is optimized for Git readiness, bypassing ZIP accumulation to handle very large packages without memory issues.
 
 It is designed as a conservative, SAP_BASIS 7.51-compatible report for teams that want a readable text export without depending on newer ADT-only APIs or abapGit internals.
 
-## Highlights
+## Key Features
 
-- Preserves repository source in separate ZIP entries instead of flattening everything into one text file
-- Handles report includes, class-pool parts, and function group includes more safely
-- Adds export logging and summary output for partial failures and skipped object types
-- Produces a ZIP layout that is easier to inspect, compare, and version
+- **Direct Folder Download**: Writes files directly to a local path (e.g. `C:\SAP_Export\`) via `GUI_DOWNLOAD`.
+- **Git-Ready Layout**: Mirrors the ADT Package Explorer structure, allowing for immediate `git init` and `git push`.
+- **Memory Efficient**: Objects are processed and written individually, avoiding `xstring` accumulation or ZIP size limits.
+- **Broad Object Support**: Handles Programs, Classes, Interfaces, Function Groups, and full DDIC metadata (Tables, Views, Domains, Data Elements, etc.).
+- **CDS Support**: Full support for Core Data Services (DDLS, DDLX, DCLS) on HANA systems.
 
 ## What it exports
 
 - Programs (`PROG`) with main program and includes
-- Classes (`CLAS`) with separate class-pool parts where available
+- Classes (`CLAS`) with separate class-pool parts (Locals, Macros, Tests)
 - Function groups (`FUGR`) with main program, includes, and function module inventory
-- DDIC tables (`TABL`) with field and technical metadata
-- DDIC views (`VIEW`) with table and field metadata
+- DDIC tables (`TABL`) with expanded field and technical metadata
+- DDIC views (`VIEW`) with table and field mapping
+- Data elements (`DTEL`) and Domains (`DOMA`) with fixed values
+- Message classes (`MSAG`) with message texts
+- Enhancement spots (`ENHS`) and BAdI definitions
+- Core Data Services (`DDLS`, `DDLX`, `DCLS`) as `.asddls` / `.asddlxs` / `.asdcls`
 
-## SAP compatibility
-
-- Targeted for `SAP_BASIS 7.51`
-- Uses conservative ABAP syntax
-- Avoids modern syntax that is risky on older systems
-- Keeps `GUI_DOWNLOAD` for simple front-end ZIP download
-
-## Repository layout
+## Repository Layout
 
 ```text
 src/
-  Z_EXPORT_PKG_ADT_TEXT.abap
-docs/
-  REVIEW_NOTES.md
-```
+  Z_EXPORT_PACKAGE_SOURCE.abap (The report)
+    ...
+      <PROG>.prog.abap
+        <INTF>.intf.abap
+          <CLAS>/
+              <CLAS>.clas.abap
+                  <CLAS>.clas.locals_def.abap
+                      ...
+                        <FUGR>/
+                            <FUGR>.fugr.abap
+                                <FM>.fugr.func.abap
+                                  <TABL>.tabl.txt
+                                    <DDLS>.ddls.asddls
+                                    ```
 
-## ZIP output layout
+                                    ## Usage
 
-```text
-src/prog/<program>/main.abap
-src/prog/<program>/includes/<include>.abap
-src/clas/<class>/cp.abap
-src/clas/<class>/ccdef.abap
-src/clas/<class>/ccimp.abap
-src/clas/<class>/ccmac.abap
-src/clas/<class>/ccau.abap
-src/fugr/<group>/main.abap
-src/fugr/<group>/includes/<include>.abap
-src/fugr/<group>/function_modules.txt
-src/ddic/tabl/<table>.txt
-src/ddic/view/<view>.txt
-logs/export_log.txt
-logs/export_summary.txt
-```
+                                    1. Create the report in SAP using the source in `src/Z_EXPORT_PACKAGE_SOURCE.abap`.
+                                    2. Execute the report.
+                                    3. Enter the Package name and the Local Target Path (e.g. `C:\SAP_Export\`).
+                                    4. Execute (F8).
 
-## Usage
+                                    ## SAP Compatibility
 
-1. Create the report in SAP as `Z_EXPORT_PKG_ADT_TEXT`.
-2. Copy the contents of [`src/Z_EXPORT_PKG_ADT_TEXT.abap`](./src/Z_EXPORT_PKG_ADT_TEXT.abap).
-3. Execute the report with:
-   - `P_PACK` = package name
-   - `P_PATH` = local ZIP target path
+                                    - Targeted for `SAP_BASIS 7.51` and higher.
+                                    - Works on HANA and non-HANA systems (CDS objects skipped if tables missing).
+                                    - Uses conservative ABAP syntax to ensure maximum compatibility.
+                                    - Uses `GUI_DOWNLOAD` with `FILETYPE='ASC'` for direct filesystem output.
 
-## Current scope
+                                    ## License
 
-- Supported export types: `PROG`, `CLAS`, `FUGR`, `TABL`, `VIEW`
-- Logged but not exported in this version: `INTF`, `DDLS`, enhancements, and other unsupported repository object types
-
-## Review and rationale
-
-The refactoring notes behind this version are documented in [`docs/REVIEW_NOTES.md`](./docs/REVIEW_NOTES.md). They explain the gaps in the original implementation and the conservative improvements made here.
-
-## Notes
-
-- `GUI_DOWNLOAD` means the report is intended for dialog execution, not background mode.
-- Unsupported package object types are logged so gaps are visible during export.
-- CDS views, interfaces, and enhancements are intentionally not force-exported by unreliable assumptions in this version.
-- The current selection reads only objects directly assigned to the chosen package, not the full subpackage tree.
+                                    MIT
+                                    

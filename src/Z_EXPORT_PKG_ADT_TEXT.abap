@@ -1,1191 +1,697 @@
-*---------------------------------------------------------------------*
-* Report  : Z_EXPORT_PKG_ADT_TEXT
-* Purpose : Export package repository objects into a ZIP file
-* Notes   : SAP_BASIS 7.51 compatible, conservative refactoring
-*---------------------------------------------------------------------*
-REPORT z_export_pkg_adt_text.
-
-CONSTANTS gc_nl TYPE string VALUE cl_abap_char_utilities=>newline.
-
+*&---------------------------------------------------------------------*
+*& Report : Z_EXPORT_PACKAGE_SOURCE
+*& Version : 2.0 - Direct folder download (no ZIP)
+*& Release : ABAP 7.51 / HANA 2.00
+*&
+*& Key design (learned from Z_MASS_ABAP_DOWNLOAD reference):
+*& . Each object written individually via GUI_DOWNLOAD FILETYPE='ASC'
+*& . trunc_trailing_blanks='X' strips char255 padding at download layer
+*& . No cl_abap_zip, no cl_abap_codepage, no xstring accumulation
+*& . Content built as APPEND-only string tables (no && loops)
+*& . DD_INT_TABL_GET + DD_TABL_EXPAND for full DDIC field expansion
+*& . DD_DOMA_GET for domain fixed values
+*& . Output folder is git-ready: git init + git push works directly
+*&
+*& Folder structure (mirrors ADT Package Explorer):
+*& <base_path>\<PACK>\
+*& <PACK>.devc.txt
+*& src\
+*& <PROG>.prog.abap
+*& <INTF>.intf.abap
+*& <CLAS>\
+*& <CLAS>.clas.abap
+*& <CLAS>.clas.locals_def.abap
+*& <CLAS>.clas.locals_imp.abap
+*& <CLAS>.clas.testclasses.abap
+*& <FUGR>\
+*& <FUGR>.fugr.abap (TOP include)
+*& <FM>.fugr.func.abap (one per FM)
+*& <TABL>.tabl.txt / <DTEL>.dtel.txt / <DOMA>.doma.txt
+*& <VIEW>.view.txt / <SHLP>.shlp.txt / <MSAG>.msag.txt
+*& <ENHS>.enhs.txt / <TYPE>.type.abap
+*& <SUBPACK>\
+*& <SUBPACK>.devc.txt
+*& src\ ...
+*&---------------------------------------------------------------------*
+REPORT z_export_package_source.
+*----------------------------------------------------------------------*
+* GLOBAL TYPES
+*----------------------------------------------------------------------*
+TYPES: " char255 - only type that works reliably with READ REPORT in 7.51
+ty_src_table TYPE STANDARD TABLE OF char255 WITH DEFAULT KEY,
+" String table for manually assembled DDIC / metadata content
+ty_str_lines TYPE STANDARD TABLE OF string WITH DEFAULT KEY,
+" TADIR object record
+BEGIN OF ty_tadir_obj,
+pgmid TYPE pgmid,
+object TYPE trobjtype,
+obj_name TYPE sobj_name,
+devclass TYPE devclass,
+END OF ty_tadir_obj,
+tt_tadir_obj TYPE STANDARD TABLE OF ty_tadir_obj WITH DEFAULT KEY.
+*----------------------------------------------------------------------*
+* SELECTION SCREEN
+*----------------------------------------------------------------------*
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME.
 PARAMETERS: p_pack TYPE devclass OBLIGATORY,
-            p_path TYPE string DEFAULT 'C:\temp\adt_export.zip'.
-
-TYPES: tt_source TYPE STANDARD TABLE OF char255 WITH DEFAULT KEY.
-
-TYPES: BEGIN OF ty_tadir,
-         object   TYPE tadir-object,
-         obj_name TYPE tadir-obj_name,
-       END OF ty_tadir.
-TYPES tt_tadir TYPE STANDARD TABLE OF ty_tadir WITH DEFAULT KEY.
-
-TYPES tt_progname TYPE STANDARD TABLE OF progname WITH DEFAULT KEY.
-
-TYPES: BEGIN OF ty_log,
-         status   TYPE c LENGTH 1,
-         object   TYPE trobjtype,
-         obj_name TYPE string,
-         message  TYPE string,
-       END OF ty_log.
-TYPES tt_log TYPE STANDARD TABLE OF ty_log WITH DEFAULT KEY.
-
-TYPES: BEGIN OF ty_enlfdir,
-         funcname TYPE rs38l_fnam,
-       END OF ty_enlfdir.
-TYPES tt_enlfdir TYPE STANDARD TABLE OF ty_enlfdir WITH DEFAULT KEY.
-
-CLASS lcl_text DEFINITION.
-  PUBLIC SECTION.
-    CLASS-METHODS append_line
-      IMPORTING iv_line TYPE string
-      CHANGING  cv_text TYPE string.
-    CLASS-METHODS source_to_string
-      IMPORTING it_source TYPE tt_source
-      RETURNING VALUE(rv_text) TYPE string.
+p_path TYPE string DEFAULT 'C:\SAP_Export\'.
+SELECTION-SCREEN END OF BLOCK b1.
+*----------------------------------------------------------------------*
+* EXCEPTION
+*----------------------------------------------------------------------*
+CLASS lcx_export_error DEFINITION INHERITING FROM cx_static_check FINAL.
+PUBLIC SECTION.
+METHODS constructor IMPORTING iv_msg TYPE string.
+METHODS get_text REDEFINITION.
+PRIVATE SECTION.
+DATA mv_msg TYPE string.
 ENDCLASS.
-
-CLASS lcl_text IMPLEMENTATION.
-  METHOD append_line.
-    IF cv_text IS INITIAL.
-      cv_text = iv_line.
-    ELSE.
-      CONCATENATE cv_text iv_line INTO cv_text SEPARATED BY gc_nl.
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD source_to_string.
-    DATA lv_line TYPE char255.
-    DATA lv_text_line TYPE string.
-
-    CLEAR rv_text.
-
-    LOOP AT it_source INTO lv_line.
-      lv_text_line = lv_line.
-      append_line(
-        EXPORTING
-          iv_line = lv_text_line
-        CHANGING
-          cv_text = rv_text ).
-    ENDLOOP.
-  ENDMETHOD.
+CLASS lcx_export_error IMPLEMENTATION.
+METHOD constructor.
+super->constructor( ).
+mv_msg = iv_msg.
+ENDMETHOD.
+METHOD get_text.
+result = mv_msg.
+ENDMETHOD.
 ENDCLASS.
-
-CLASS lcl_zip_writer DEFINITION.
-  PUBLIC SECTION.
-    METHODS add_file
-      IMPORTING iv_name    TYPE string
-                iv_content TYPE string.
-    METHODS get_zip
-      RETURNING VALUE(rv_zip) TYPE xstring.
-  PRIVATE SECTION.
-    DATA mo_zip TYPE REF TO cl_abap_zip.
+*----------------------------------------------------------------------*
+* CLASS: LCL_FILE_WRITER
+* Owns all filesystem interaction.
+* write_source : for char255 tables from READ REPORT
+* write_lines : for string tables of DDIC / metadata text
+* Both call GUI_DOWNLOAD with FILETYPE='ASC' trunc_trailing_blanks='X'
+*----------------------------------------------------------------------*
+CLASS lcl_file_writer DEFINITION FINAL.
+PUBLIC SECTION.
+CLASS-METHODS write_source IMPORTING iv_path TYPE string it_lines TYPE ty_src_table.
+CLASS-METHODS write_lines IMPORTING iv_path TYPE string it_lines TYPE ty_str_lines.
+CLASS-METHODS ensure_path IMPORTING iv_dir TYPE string.
+PRIVATE SECTION.
+CLASS-METHODS dir_of IMPORTING iv_full_path TYPE string RETURNING VALUE(rv_dir) TYPE string.
+CLASS-METHODS do_download IMPORTING iv_path TYPE string CHANGING ct_tab TYPE STANDARD TABLE.
 ENDCLASS.
-
-CLASS lcl_zip_writer IMPLEMENTATION.
-  METHOD add_file.
-    DATA lv_xstring TYPE xstring.
-
-    IF iv_name IS INITIAL.
-      RETURN.
-    ENDIF.
-
-    IF iv_content IS INITIAL.
-      RETURN.
-    ENDIF.
-
-    IF mo_zip IS INITIAL.
-      CREATE OBJECT mo_zip.
-    ENDIF.
-
-    lv_xstring = cl_abap_codepage=>convert_to( iv_content ).
-
-    mo_zip->add(
-      name    = iv_name
-      content = lv_xstring ).
-  ENDMETHOD.
-
-  METHOD get_zip.
-    CLEAR rv_zip.
-
-    IF mo_zip IS INITIAL.
-      RETURN.
-    ENDIF.
-
-    rv_zip = mo_zip->save( ).
-  ENDMETHOD.
+CLASS lcl_file_writer IMPLEMENTATION.
+METHOD dir_of.
+" Return everything up to and including the last backslash
+DATA(lv_len) = strlen( iv_full_path ).
+DO lv_len TIMES.
+DATA(lv_pos) = lv_len - sy-index.
+IF iv_full_path+lv_pos(1) = '\'.
+rv_dir = iv_full_path+0(lv_pos) && '\'.
+RETURN.
+ENDIF.
+ENDDO.
+rv_dir = iv_full_path.
+ENDMETHOD.
+ENDMETHOD.
+METHOD ensure_path.
+" Create every level of the path (Windows mkdir does not create
+" intermediate directories in one call).
+DATA lt_parts TYPE ty_str_lines.
+DATA lv_cur TYPE string.
+SPLIT iv_dir AT '\' INTO TABLE lt_parts.
+LOOP AT lt_parts INTO DATA(lv_part).
+CHECK lv_part IS NOT INITIAL.
+lv_cur = COND string( WHEN lv_cur IS INITIAL THEN lv_part && '\' ELSE lv_cur && lv_part && '\' ).
+CL_GUI_FRONTEND_SERVICES=>DIRECTORY_CREATE( EXPORTING directory = lv_cur EXCEPTIONS directory_create_failed = 1 OTHERS = 2 ).
+" Ignore sy-subrc - the directory may already exist
+ENDLOOP.
+ENDMETHOD.
+METHOD do_download.
+ensure_path( dir_of( iv_path ) ).
+CL_GUI_FRONTEND_SERVICES=>GUI_DOWNLOAD( EXPORTING filename = iv_path filetype = 'ASC' trunc_trailing_blanks = abap_true CHANGING data_tab = ct_tab EXCEPTIONS file_write_error = 1 no_batch = 2 gui_refuse_filetransfer = 3 OTHERS = 4 ).
+IF sy-subrc <> 0.
+WRITE: / | WARNING: write failed for { iv_path } (subrc={ sy-subrc })|.
+ENDIF.
+ENDMETHOD.
+METHOD write_source.
+" Local copy needed because GUI_DOWNLOAD CHANGING expects a variable
+DATA lt_local TYPE ty_src_table.
+lt_local = it_lines.
+do_download( EXPORTING iv_path = iv_path CHANGING ct_tab = lt_local ).
+ENDMETHOD.
+METHOD write_lines.
+DATA lt_local TYPE ty_str_lines.
+lt_local = it_lines.
+do_download( EXPORTING iv_path = iv_path CHANGING ct_tab = lt_local ).
+ENDMETHOD.
 ENDCLASS.
-
-CLASS lcl_logger DEFINITION.
-  PUBLIC SECTION.
-    METHODS add_success
-      IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE string
-                iv_message TYPE string.
-    METHODS add_warning
-      IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE string
-                iv_message TYPE string.
-    METHODS add_error
-      IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE string
-                iv_message TYPE string.
-    METHODS add_info
-      IMPORTING iv_object  TYPE trobjtype
-                iv_name    TYPE string
-                iv_message TYPE string.
-    METHODS to_string
-      RETURNING VALUE(rv_text) TYPE string.
-    METHODS summary_to_string
-      RETURNING VALUE(rv_text) TYPE string.
-  PRIVATE SECTION.
-    DATA mt_log TYPE tt_log.
-    DATA mv_success TYPE i.
-    DATA mv_warning TYPE i.
-    DATA mv_error   TYPE i.
-    DATA mv_info    TYPE i.
-    METHODS add_entry
-      IMPORTING iv_status  TYPE c
-                iv_object  TYPE trobjtype
-                iv_name    TYPE string
-                iv_message TYPE string.
+*----------------------------------------------------------------------*
+* CLASS: LCL_SOURCE_READER
+* Reads ABAP source for code-based object types.
+* READ REPORT -> ty_src_table (char255) -> GUI_DOWNLOAD ASC directly.
+* No string conversion, no accumulation - zero encoding issues.
+*----------------------------------------------------------------------*
+CLASS lcl_source_reader DEFINITION FINAL.
+PUBLIC SECTION.
+" Low-level include reader
+CLASS-METHODS read_include IMPORTING iv_prog TYPE programm RETURNING VALUE(rt_lines) TYPE ty_src_table.
+" One method per object type; writes directly to disk
+CLASS-METHODS write_prog IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_intf IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_class IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_fugr IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_type IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+PRIVATE SECTION.
+CLASS-METHODS write_if_not_empty IMPORTING iv_path TYPE string it_src TYPE ty_src_table.
 ENDCLASS.
-
-CLASS lcl_logger IMPLEMENTATION.
-  METHOD add_entry.
-    DATA ls_log TYPE ty_log.
-
-    CLEAR ls_log.
-    ls_log-status   = iv_status.
-    ls_log-object   = iv_object.
-    ls_log-obj_name = iv_name.
-    ls_log-message  = iv_message.
-    APPEND ls_log TO mt_log.
-
-    CASE iv_status.
-      WHEN 'S'.
-        mv_success = mv_success + 1.
-      WHEN 'W'.
-        mv_warning = mv_warning + 1.
-      WHEN 'E'.
-        mv_error = mv_error + 1.
-      WHEN OTHERS.
-        mv_info = mv_info + 1.
-    ENDCASE.
-  ENDMETHOD.
-
-  METHOD add_success.
-    add_entry(
-      EXPORTING
-        iv_status  = 'S'
-        iv_object  = iv_object
-        iv_name    = iv_name
-        iv_message = iv_message ).
-  ENDMETHOD.
-
-  METHOD add_warning.
-    add_entry(
-      EXPORTING
-        iv_status  = 'W'
-        iv_object  = iv_object
-        iv_name    = iv_name
-        iv_message = iv_message ).
-  ENDMETHOD.
-
-  METHOD add_error.
-    add_entry(
-      EXPORTING
-        iv_status  = 'E'
-        iv_object  = iv_object
-        iv_name    = iv_name
-        iv_message = iv_message ).
-  ENDMETHOD.
-
-  METHOD add_info.
-    add_entry(
-      EXPORTING
-        iv_status  = 'I'
-        iv_object  = iv_object
-        iv_name    = iv_name
-        iv_message = iv_message ).
-  ENDMETHOD.
-
-  METHOD to_string.
-    DATA ls_log TYPE ty_log.
-    DATA lv_line TYPE string.
-    DATA lv_value TYPE string.
-
-    CLEAR rv_text.
-
-    LOOP AT mt_log INTO ls_log.
-      CLEAR lv_line.
-      CONCATENATE ls_log-status
-                  ls_log-object
-                  ls_log-obj_name
-                  ls_log-message
-             INTO lv_line
-             SEPARATED BY space.
-
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = lv_line
-        CHANGING
-          cv_text = rv_text ).
-    ENDLOOP.
-  ENDMETHOD.
-
-  METHOD summary_to_string.
-    DATA lv_line TYPE string.
-    DATA lv_value TYPE string.
-
-    CLEAR rv_text.
-
-    CONCATENATE 'Package:' p_pack INTO lv_line SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = rv_text ).
-
-    CLEAR lv_line.
-    WRITE mv_success TO lv_value.
-    CONCATENATE 'Successful exports:' lv_value INTO lv_line SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = rv_text ).
-
-    CLEAR lv_line.
-    WRITE mv_warning TO lv_value.
-    CONCATENATE 'Warnings:' lv_value INTO lv_line SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = rv_text ).
-
-    CLEAR lv_line.
-    WRITE mv_error TO lv_value.
-    CONCATENATE 'Errors:' lv_value INTO lv_line SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = rv_text ).
-
-    CLEAR lv_line.
-    WRITE mv_info TO lv_value.
-    CONCATENATE 'Info:' lv_value INTO lv_line SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = rv_text ).
-  ENDMETHOD.
-ENDCLASS.
-
-CLASS lcl_source_reader DEFINITION.
-  PUBLIC SECTION.
-    METHODS read_report_safe
-      IMPORTING iv_prog TYPE progname
-      EXPORTING et_source TYPE tt_source
-                ev_found  TYPE abap_bool.
-    METHODS get_all_includes
-      IMPORTING iv_prog TYPE progname
-      RETURNING VALUE(rt_includes) TYPE tt_progname.
-    METHODS build_class_part_program
-      IMPORTING iv_class  TYPE seoclsname
-                iv_suffix TYPE char10
-      RETURNING VALUE(rv_prog) TYPE progname.
-ENDCLASS.
-
 CLASS lcl_source_reader IMPLEMENTATION.
-  METHOD read_report_safe.
-    CLEAR et_source.
-    CLEAR ev_found.
-
-    READ REPORT iv_prog INTO et_source.
-    IF sy-subrc = 0 AND et_source IS NOT INITIAL.
-      ev_found = abap_true.
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD get_all_includes.
-    DATA lv_include TYPE progname.
-
-    CLEAR rt_includes.
-
-    CALL FUNCTION 'RS_GET_ALL_INCLUDES'
-      EXPORTING
-        program    = iv_prog
-      TABLES
-        includetab = rt_includes
-      EXCEPTIONS
-        OTHERS     = 1.
-
-    SORT rt_includes BY table_line.
-    DELETE ADJACENT DUPLICATES FROM rt_includes COMPARING table_line.
-
-    DELETE rt_includes WHERE table_line IS INITIAL.
-
-    LOOP AT rt_includes INTO lv_include.
-      IF lv_include = iv_prog.
-        DELETE rt_includes.
-      ENDIF.
-    ENDLOOP.
-  ENDMETHOD.
-
-  METHOD build_class_part_program.
-    CONCATENATE iv_class '==========' iv_suffix INTO rv_prog.
-  ENDMETHOD.
+METHOD read_include.
+READ REPORT iv_prog INTO rt_lines.
+" READ REPORT sets sy-subrc; caller decides what to do with empty result
+ENDMETHOD.
+METHOD write_if_not_empty.
+CHECK it_src IS NOT INITIAL.
+lcl_file_writer=>write_source( iv_path = iv_path it_lines = it_src ).
+ENDMETHOD.
+METHOD write_prog.
+lcl_file_writer=>write_source( iv_path = iv_dir && iv_name && '.prog.abap' it_lines = read_include( CONV programm( iv_name ) ) ).
+ENDMETHOD.
+METHOD write_intf.
+" Interface pool is stored as program with the interface name
+lcl_file_writer=>write_source( iv_path = iv_dir && iv_name && '.intf.abap' it_lines = read_include( CONV programm( iv_name ) ) ).
+ENDMETHOD.
+METHOD write_class.
+DATA(lv_cls) = CONV seoclsname( iv_name ).
+DATA(lv_dir) = iv_dir && iv_name && '\'.
+" -- Main pool (definition + implementation merged) -------------
+lcl_file_writer=>write_source( iv_path = lv_dir && iv_name && '.clas.abap' it_lines = read_include( CONV programm( iv_name ) ) ).
+" -- Local type definitions (====CCDEF include) -------------
+TRY.
+write_if_not_empty( iv_path = lv_dir && iv_name && '.clas.locals_def.abap' it_src = read_include( CONV programm( cl_oo_classname_service=>get_ccdef_name( lv_cls ) ) ) ).
+CATCH cx_root.
+ENDTRY.
+" -- Local class implementations (====CCIMP include) ----------
+TRY.
+write_if_not_empty( iv_path = lv_dir && iv_name && '.clas.locals_imp.abap' it_src = read_include( CONV programm( cl_oo_classname_service=>get_ccimp_name( lv_cls ) ) ) ).
+CATCH cx_root.
+ENDTRY.
+" -- Macro definitions (====CCMAC include) --------------------
+TRY.
+write_if_not_empty( iv_path = lv_dir && iv_name && '.clas.macros.abap' it_src = read_include( CONV programm( cl_oo_classname_service=>get_ccmac_name( lv_cls ) ) ) ).
+CATCH cx_root.
+ENDTRY.
+" -- ABAP Unit test classes (====CCAU include) ---------------
+TRY.
+write_if_not_empty( iv_path = lv_dir && iv_name && '.clas.testclasses.abap' it_src = read_include( CONV programm( cl_oo_classname_service=>get_ccau_name( lv_cls ) ) ) ).
+CATCH cx_root.
+ENDTRY.
+ENDMETHOD.
+METHOD write_fugr.
+DATA(lv_dir) = iv_dir && iv_name && '\'.
+" -- TOP include: L<FUGR>TOP (global data / declarations) ------
+lcl_file_writer=>write_source( iv_path = lv_dir && iv_name && '.fugr.abap' it_lines = read_include( CONV programm( |L{ iv_name }TOP| ) ) ).
+" -- UXX include: L<FUGR>UXX (FM container - list only) --------
+write_if_not_empty( iv_path = lv_dir && iv_name && '.fugr.uxx.abap' it_src = read_include( CONV programm( |L{ iv_name }UXX| ) ) ).
+" -- Individual FMs via TFDIR-INCLUDE (confirmed working pattern) -
+SELECT funcname, include FROM tfdir WHERE pname = @( |SAPL{ iv_name }| ) INTO TABLE @DATA(lt_fms).
+LOOP AT lt_fms INTO DATA(ls_fm).
+write_if_not_empty( iv_path = lv_dir && ls_fm-funcname && '.fugr.func.abap' it_src = read_include( CONV programm( ls_fm-include ) ) ).
+ENDLOOP.
+ENDMETHOD.
+METHOD write_type.
+" Type groups are stored as ABAP programs of type T
+DATA lv_prog TYPE programm.
+lv_prog = iv_name. " Assign via variable to avoid inline CONV issue
+lcl_file_writer=>write_source( iv_path = iv_dir && iv_name && '.type.abap' it_lines = read_include( lv_prog ) ).
+ENDMETHOD.
 ENDCLASS.
-
-CLASS lcl_ddic_exporter DEFINITION.
-  PUBLIC SECTION.
-    METHODS get_table_text
-      IMPORTING iv_tabname TYPE tabname
-      EXPORTING ev_text    TYPE string
-                ev_found   TYPE abap_bool.
-    METHODS get_view_text
-      IMPORTING iv_viewname TYPE tabname
-      EXPORTING ev_text     TYPE string
-                ev_found    TYPE abap_bool.
+*----------------------------------------------------------------------*
+* CLASS: LCL_DDIC_READER
+* Reads DDIC metadata and writes human-readable text files.
+* Uses DD_INT_TABL_GET + DD_TABL_EXPAND (as Z_MASS_ABAP_DOWNLOAD does)
+* and DD_DOMA_GET for domain fixed values.
+* Content built with APPEND - never accumulated with &&.
+*----------------------------------------------------------------------*
+CLASS lcl_ddic_reader DEFINITION FINAL.
+PUBLIC SECTION.
+CLASS-METHODS write_tabl IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_dtel IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_doma IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_view IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_shlp IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_msag IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_enhs IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_ddls IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_ddlx IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+CLASS-METHODS write_dcls IMPORTING iv_name TYPE sobj_name iv_dir TYPE string.
+PRIVATE SECTION.
+" -- Small formatting helpers ----------------------------------
+CLASS-METHODS h1 IMPORTING iv_type TYPE string iv_name TYPE string CHANGING ct_out TYPE ty_str_lines.
+CLASS-METHODS attr IMPORTING iv_label TYPE string iv_value TYPE string CHANGING ct_out TYPE ty_str_lines.
+CLASS-METHODS sep CHANGING ct_out TYPE ty_str_lines.
+CLASS-METHODS blank CHANGING ct_out TYPE ty_str_lines.
 ENDCLASS.
-
-CLASS lcl_ddic_exporter IMPLEMENTATION.
-  METHOD get_table_text.
-    DATA ls_dd02v TYPE dd02v.
-    DATA ls_dd09l TYPE dd09l.
-    DATA lt_dd03p TYPE STANDARD TABLE OF dd03p WITH DEFAULT KEY.
-    DATA ls_dd03p TYPE dd03p.
-    DATA lt_dd05m TYPE STANDARD TABLE OF dd05m WITH DEFAULT KEY.
-    DATA ls_dd05m TYPE dd05m.
-    DATA lt_dd08v TYPE STANDARD TABLE OF dd08v WITH DEFAULT KEY.
-    DATA ls_dd08v TYPE dd08v.
-    DATA lt_dd12v TYPE STANDARD TABLE OF dd12v WITH DEFAULT KEY.
-    DATA ls_dd12v TYPE dd12v.
-    DATA lt_dd17v TYPE STANDARD TABLE OF dd17v WITH DEFAULT KEY.
-    DATA ls_dd17v TYPE dd17v.
-    DATA lv_line  TYPE string.
-    DATA lv_value TYPE string.
-
-    CLEAR ev_text.
-    CLEAR ev_found.
-
-    CALL FUNCTION 'DDIF_TABL_GET'
-      EXPORTING
-        name      = iv_tabname
-        langu     = sy-langu
-      IMPORTING
-        dd02v_wa  = ls_dd02v
-        dd09l_wa  = ls_dd09l
-      TABLES
-        dd03p_tab = lt_dd03p
-        dd05m_tab = lt_dd05m
-        dd08v_tab = lt_dd08v
-        dd12v_tab = lt_dd12v
-        dd17v_tab = lt_dd17v
-      EXCEPTIONS
-        illegal_input = 1
-        OTHERS        = 2.
-
-    IF sy-subrc <> 0.
-      RETURN.
-    ENDIF.
-
-    ev_found = abap_true.
-
-    CONCATENATE 'OBJECT TYPE: TABLE'
-                'NAME:'
-                iv_tabname
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    CLEAR lv_line.
-    CONCATENATE 'TABCLASS:' ls_dd02v-tabclass
-                'CONTFLAG:' ls_dd02v-contflag
-                'DDLANGUAGE:' ls_dd02v-ddlanguage
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    CLEAR lv_line.
-    CONCATENATE 'DELIVERY CLASS:' ls_dd02v-contflag
-                'AUTHCLASS:' ls_dd02v-authclass
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = 'TECHNICAL SETTINGS:'
-      CHANGING
-        cv_text = ev_text ).
-
-    CLEAR lv_line.
-    CONCATENATE 'BUFFERED:' ls_dd09l-bufallow
-                'LOGGING:' ls_dd09l-protokoll
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = 'FIELDS:'
-      CHANGING
-        cv_text = ev_text ).
-
-    LOOP AT lt_dd03p INTO ls_dd03p.
-      CLEAR lv_line.
-      WRITE ls_dd03p-position TO lv_value.
-      CONCATENATE lv_value
-                  ls_dd03p-keyflag
-                  ls_dd03p-fieldname
-                  ls_dd03p-rollname
-                  ls_dd03p-datatype
-                  ls_dd03p-leng
-                  ls_dd03p-decimals
-             INTO lv_line
-             SEPARATED BY space.
-
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = lv_line
-        CHANGING
-          cv_text = ev_text ).
-    ENDLOOP.
-
-    IF lt_dd12v IS NOT INITIAL.
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = 'INDEXES:'
-        CHANGING
-          cv_text = ev_text ).
-
-      LOOP AT lt_dd12v INTO ls_dd12v.
-        CLEAR lv_line.
-        CONCATENATE ls_dd12v-indexname
-                    ls_dd12v-sqltab
-                    ls_dd12v-dbstate
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-
-      LOOP AT lt_dd17v INTO ls_dd17v.
-        CLEAR lv_line.
-        WRITE ls_dd17v-position TO lv_value.
-        CONCATENATE 'INDEX FIELD:'
-                    ls_dd17v-indexname
-                    ls_dd17v-fieldname
-                    lv_value
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-    ENDIF.
-
-    IF lt_dd08v IS NOT INITIAL OR lt_dd05m IS NOT INITIAL.
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = 'FOREIGN KEYS:'
-        CHANGING
-          cv_text = ev_text ).
-
-      LOOP AT lt_dd08v INTO ls_dd08v.
-        CLEAR lv_line.
-        CONCATENATE ls_dd08v-fieldname
-                    ls_dd08v-checktable
-                    ls_dd08v-frkart
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-
-      LOOP AT lt_dd05m INTO ls_dd05m.
-        CLEAR lv_line.
-        CONCATENATE 'FK FIELD MAPPING:'
-                    ls_dd05m-fieldname
-                    ls_dd05m-checkfield
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD get_view_text.
-    DATA ls_dd25v TYPE dd25v.
-    DATA lt_dd26v TYPE STANDARD TABLE OF dd26v WITH DEFAULT KEY.
-    DATA ls_dd26v TYPE dd26v.
-    DATA lt_dd27p TYPE STANDARD TABLE OF dd27p WITH DEFAULT KEY.
-    DATA ls_dd27p TYPE dd27p.
-    DATA lv_line TYPE string.
-
-    CLEAR ev_text.
-    CLEAR ev_found.
-
-    CALL FUNCTION 'DDIF_VIEW_GET'
-      EXPORTING
-        name      = iv_viewname
-        state     = 'A'
-        langu     = sy-langu
-      IMPORTING
-        dd25v_wa  = ls_dd25v
-      TABLES
-        dd26v_tab = lt_dd26v
-        dd27p_tab = lt_dd27p
-      EXCEPTIONS
-        illegal_input = 1
-        OTHERS        = 2.
-
-    IF sy-subrc <> 0.
-      RETURN.
-    ENDIF.
-
-    ev_found = abap_true.
-
-    CONCATENATE 'OBJECT TYPE: VIEW'
-                'NAME:'
-                iv_viewname
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    CLEAR lv_line.
-    CONCATENATE 'VIEW CLASS:' ls_dd25v-viewclass
-                'ROOT TABLE:' ls_dd25v-roottab
-           INTO lv_line
-           SEPARATED BY space.
-    lcl_text=>append_line(
-      EXPORTING
-        iv_line = lv_line
-      CHANGING
-        cv_text = ev_text ).
-
-    IF lt_dd26v IS NOT INITIAL.
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = 'VIEW TABLES:'
-        CHANGING
-          cv_text = ev_text ).
-
-      LOOP AT lt_dd26v INTO ls_dd26v.
-        CLEAR lv_line.
-        WRITE ls_dd26v-tabpos TO lv_value.
-        CONCATENATE ls_dd26v-tabname
-                    lv_value
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-    ENDIF.
-
-    IF lt_dd27p IS NOT INITIAL.
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = 'VIEW FIELDS:'
-        CHANGING
-          cv_text = ev_text ).
-
-      LOOP AT lt_dd27p INTO ls_dd27p.
-        CLEAR lv_line.
-        CONCATENATE ls_dd27p-viewfield
-                    ls_dd27p-tabname
-                    ls_dd27p-fieldname
-                    ls_dd27p-keyflag
-               INTO lv_line
-               SEPARATED BY space.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = ev_text ).
-      ENDLOOP.
-    ENDIF.
-  ENDMETHOD.
+CLASS lcl_ddic_reader IMPLEMENTATION.
+METHOD h1.
+APPEND |* ================================================================| TO ct_out.
+APPEND |* { iv_type }: { iv_name }| TO ct_out.
+APPEND |* ================================================================| TO ct_out.
+ENDMETHOD.
+METHOD attr.
+APPEND |* { iv_label WIDTH = 22 ALIGN = LEFT PAD = ' ' } : { iv_value }| TO ct_out.
+ENDMETHOD.
+METHOD sep.
+APPEND |* { repeat( val = '-' occ = 72 ) }| TO ct_out.
+ENDMETHOD.
+METHOD blank.
+APPEND || TO ct_out.
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" TABL / INTTAB - uses DD_INT_TABL_GET + DD_TABL_EXPAND (reference prog)
+"--------------------------------------------------------------------------
+METHOD write_tabl.
+DATA lt_out TYPE ty_str_lines.
+DATA lt_flds TYPE STANDARD TABLE OF dd03p WITH DEFAULT KEY.
+DATA ls_d02l TYPE dd02l.
+DATA ls_d02t TYPE dd02t.
+DATA ls_d02v TYPE dd02v.
+DATA lv_tab TYPE tabname.
+lv_tab = iv_name.
+SELECT SINGLE tabclass, contflag, authclass, columnstore FROM dd02l INTO @DATA(ls_hdr) WHERE tabname = @lv_tab AND as4local = 'A'.
+SELECT SINGLE ddtext FROM dd02t INTO @DATA(lv_ddtext) WHERE tabname = @lv_tab AND ddlanguage = @sy-langu.
+DATA(lv_lbl) = SWITCH string( ls_hdr-tabclass WHEN 'INTTAB' THEN 'STRUCTURE' WHEN 'TRANSP' THEN 'TRANSPARENT TABLE' WHEN 'CLUSTER' THEN 'CLUSTER TABLE' WHEN 'POOL' THEN 'POOLED TABLE' ELSE 'TABLE' ).
+h1( EXPORTING iv_type = lv_lbl iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ lv_ddtext }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Table Class' iv_value = |{ ls_hdr-tabclass }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Storage Type' iv_value = |{ COND #( WHEN ls_hdr-columnstore = 'X' THEN 'COLUMN STORE' ELSE 'ROW STORE' ) }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Delivery Class' iv_value = |{ ls_hdr-contflag }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Auth Class' iv_value = |{ ls_hdr-authclass}| CHANGING ct_out = lt_out ).
+" Get fully-expanded field list (resolves includes, aggregates etc.)
+CALL FUNCTION 'DD_INT_TABL_GET' EXPORTING tabname = lv_tab langu = sy-langu IMPORTING dd02v_n = ls_d02v TABLES dd03p_n = lt_flds EXCEPTIONS internal_error = 1 OTHERS = 2.
+IF sy-subrc = 0 AND ls_d02v IS NOT INITIAL.
+CALL FUNCTION 'DD_TABL_EXPAND' EXPORTING dd02v_wa = ls_d02v mode = 46 prid = 0 TABLES dd03p_tab = lt_flds EXCEPTIONS illegal_parameter = 1 OTHERS = 2.
+ENDIF.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* FIELDS:' TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+APPEND |* { 'FIELD' WIDTH = 25 ALIGN = LEFT PAD = ' ' } { 'TYPE' WIDTH = 8 ALIGN = LEFT PAD = ' ' }{ 'LEN' WIDTH = 6 ALIGN = LEFT PAD = ' ' }DEC KEY DESCRIPTION| TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+LOOP AT lt_flds INTO DATA(ls_f) WHERE adminfield = 0 AND fieldname(1) <> '.'.
+DATA(lv_key) = SWITCH string( ls_f-keyflag WHEN 'X' THEN ' X ' ELSE ' ' ).
+APPEND |* { ls_f-fieldname WIDTH = 25 ALIGN = LEFT PAD = ' ' } { ls_f-datatype WIDTH = 8 ALIGN = LEFT PAD = ' ' }{ ls_f-leng WIDTH = 6 ALIGN = LEFT PAD = ' ' }{ ls_f-decimals WIDTH = 3 ALIGN = LEFT PAD = ' ' }{ lv_key }{ ls_f-ddtext }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.tabl.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" DTEL - direct SELECT from DD04V view + DD04T text
+"--------------------------------------------------------------------------
+METHOD write_dtel.
+DATA lt_out TYPE ty_str_lines.
+DATA ls_v TYPE dd04v.
+DATA ls_t TYPE dd04t.
+DATA lv_roll TYPE rollname.
+lv_roll = iv_name.
+SELECT SINGLE domname, datatype, leng, decimals, shlpname FROM dd04v INTO @DATA(ls_v_sel) WHERE rollname = @lv_roll AND as4local = 'A'.
+SELECT SINGLE ddtext, scrtext_s, scrtext_m, scrtext_l, reptext FROM dd04t INTO @DATA(ls_t_sel) WHERE rollname = @lv_roll AND ddlanguage = @sy-langu.
+h1( EXPORTING iv_type = 'DATA ELEMENT' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ ls_t_sel-ddtext }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Domain' iv_value = |{ ls_v_sel-domname }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Data Type' iv_value = |{ ls_v_sel-datatype }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Length' iv_value = |{ ls_v_sel-leng }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Decimals' iv_value = |{ ls_v_sel-decimals }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Search Help' iv_value = |{ ls_v_sel-shlpname }| CHANGING ct_out = lt_out ).
+blank( CHANGING ct_out = lt_out ).
+APPEND '* FIELD LABELS:' TO lt_out.
+attr( EXPORTING iv_label = 'Short' iv_value = |{ ls_t_sel-scrtext_s }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Medium' iv_value = |{ ls_t_sel-scrtext_m }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Long' iv_value = |{ ls_t_sel-scrtext_l }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Heading' iv_value = |{ ls_t_sel-reptext }| CHANGING ct_out = lt_out ).
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.dtel.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" DOMA - header via DD01V + fixed values via DD_DOMA_GET (reference prog)
+"--------------------------------------------------------------------------
+METHOD write_doma.
+DATA lt_out TYPE ty_str_lines.
+DATA lt_fvals TYPE STANDARD TABLE OF dd07v WITH DEFAULT KEY.
+DATA lv_dom TYPE domname.
+lv_dom = iv_name.
+SELECT SINGLE datatype, leng, decimals, outputlen, lowercase, convexit, entitytab FROM dd01v INTO @DATA(ls_v) WHERE domname = @lv_dom AND as4local = 'A'.
+SELECT SINGLE ddtext FROM dd01t INTO @DATA(lv_ddtext) WHERE domname = @lv_dom AND ddlanguage = @sy-langu.
+" DD_DOMA_GET returns fixed values with texts in one call
+CALL FUNCTION 'DD_DOMA_GET' EXPORTING domain_name = lv_dom get_state = 'A ' langu = sy-langu withtext = 'X' TABLES dd07v_tab_a = lt_fvals EXCEPTIONS illegal_value = 1 op_failure = 2 OTHERS = 3.
+h1( EXPORTING iv_type = 'DOMAIN' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ lv_ddtext }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Data Type' iv_value = |{ ls_v-datatype }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Length' iv_value = |{ ls_v-leng }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Decimals' iv_value = |{ ls_v-decimals }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Output Length' iv_value = |{ ls_v-outputlen }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Lowercase' iv_value = |{ ls_v-lowercase }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Conversion Exit' iv_value = |{ ls_v-convexit }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Value Table' iv_value = |{ ls_v-entitytab }| CHANGING ct_out = lt_out ).
+IF lt_fvals IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* FIXED VALUES:' TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+APPEND |* { 'LOW' WIDTH = 20 ALIGN = LEFT PAD = ' ' } { 'HIGH' WIDTH = 20 ALIGN = LEFT PAD = ' ' } DESCRIPTION| TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+LOOP AT lt_fvals INTO DATA(ls_v2).
+APPEND |* { ls_v2-domvalue_l WIDTH = 20 ALIGN = LEFT PAD = ' ' } { ls_v2-domvalue_h WIDTH = 20 ALIGN = LEFT PAD = ' ' } { ls_v2-ddtext }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+ENDIF.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.doma.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" VIEW - DD25V header + DD26E base tables + DD27P field mapping
+"--------------------------------------------------------------------------
+METHOD write_view.
+DATA lt_out TYPE ty_str_lines.
+DATA lt_tabs TYPE STANDARD TABLE OF dd26e WITH DEFAULT KEY.
+DATA lt_flds TYPE STANDARD TABLE OF dd27p WITH DEFAULT KEY.
+DATA lv_view TYPE viewname.
+lv_view = iv_name.
+SELECT SINGLE viewclass FROM dd25v INTO @DATA(lv_vclass) WHERE viewname = @lv_view AND as4local = 'A'.
+SELECT SINGLE ddtext FROM dd25t INTO @DATA(lv_ddtext) WHERE viewname = @lv_view AND ddlanguage = @sy-langu.
+SELECT tabname FROM dd26e INTO TABLE @lt_tabs WHERE viewname = @lv_view.
+SELECT viewfield, tabname, fieldname FROM dd27p INTO TABLE @lt_flds WHERE viewname = @lv_view ORDER BY viewfield.
+h1( EXPORTING iv_type = 'VIEW' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ lv_ddtext }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'View Class' iv_value = |{ lv_vclass }| CHANGING ct_out = lt_out ).
+IF lt_tabs IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* BASE TABLES:' TO lt_out.
+LOOP AT lt_tabs INTO DATA(ls_t).
+APPEND |* -> { ls_t-tabname }| TO lt_out.
+ENDLOOP.
+ENDIF.
+IF lt_flds IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* FIELD MAPPING:' TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+APPEND |* { 'VIEW FIELD' WIDTH = 22 ALIGN = LEFT PAD = ' ' } { 'TABLE' WIDTH = 14 ALIGN = LEFT PAD = ' ' } TABLE FIELD| TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+LOOP AT lt_flds INTO DATA(ls_f).
+APPEND |* { ls_f-viewfield WIDTH = 22 ALIGN = LEFT PAD = ' ' } { ls_f-tabname WIDTH = 14 ALIGN = LEFT PAD = ' ' } { ls_f-fieldname }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+ENDIF.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.view.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" SHLP - DD30V header + DD32V parameters
+" Fields used: shlpname (parameter name in DD32V), fieldname, lpos, spos
+" shlpparm does NOT exist in all releases; avoided deliberately
+"--------------------------------------------------------------------------
+METHOD write_shlp.
+DATA lt_out TYPE ty_str_lines.
+DATA lt_pars TYPE STANDARD TABLE OF dd32v WITH DEFAULT KEY.
+DATA lv_shlp TYPE shlpname.
+lv_shlp = iv_name.
+SELECT SINGLE selmtype FROM dd30v INTO @DATA(lv_selmtype) WHERE shlpname = @lv_shlp AND as4local = 'A'.
+SELECT SINGLE ddtext FROM dd30t INTO @DATA(lv_ddtext) WHERE shlpname = @lv_shlp AND ddlanguage = @sy-langu.
+SELECT shlpname, fieldname, lpos, spos FROM dd32v INTO TABLE @lt_pars WHERE shlpname = @lv_shlp.
+h1( EXPORTING iv_type = 'SEARCH HELP' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ lv_ddtext }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Selection Method' iv_value = |{ lv_selmtype }| CHANGING ct_out = lt_out ).
+IF lt_pars IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* PARAMETERS:' TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+APPEND |* { 'PARAMETER' WIDTH = 20 ALIGN = LEFT PAD = ' ' } { 'FIELD' WIDTH = 20 ALIGN = LEFT PAD = ' ' } LPOS SPOS| TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+LOOP AT lt_pars INTO DATA(ls_p).
+APPEND |* { ls_p-shlpname WIDTH = 20 ALIGN = LEFT PAD = ' ' } { ls_p-fieldname WIDTH = 20 ALIGN = LEFT PAD = ' ' } { ls_p-lpos WIDTH = 4 ALIGN = LEFT PAD = ' ' } { ls_p-spos }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+ENDIF.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.shlp.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" MSAG - T100A header + T100 messages (all languages)
+"--------------------------------------------------------------------------
+METHOD write_msag.
+DATA lt_out TYPE ty_str_lines.
+DATA lv_msg TYPE arbgb.
+lv_msg = iv_name.
+SELECT SINGLE stext FROM t100a INTO @DATA(lv_stext) WHERE arbgb = @lv_msg.
+h1( EXPORTING iv_type = 'MESSAGE CLASS' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ lv_stext }| CHANGING ct_out = lt_out ).
+blank( CHANGING ct_out = lt_out ).
+sep( CHANGING ct_out = lt_out ).
+APPEND |* { 'NO' WIDTH = 5 ALIGN = LEFT PAD = ' ' } { 'LANG' WIDTH = 5 ALIGN = LEFT PAD = ' ' } TEXT| TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+SELECT msgnr, sprsl, text FROM t100 INTO TABLE @DATA(lt_msgs) WHERE arbgb = @lv_msg ORDER BY msgnr, sprsl.
+LOOP AT lt_msgs INTO DATA(ls_m).
+APPEND |* { ls_m-msgnr WIDTH = 5 ALIGN = LEFT PAD = ' ' } { ls_m-sprsl WIDTH = 5 ALIGN = LEFT PAD = ' ' } { ls_m-text }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.msag.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" ENHS - Enhancement spot + embedded BAdI definitions + hook spots
+"--------------------------------------------------------------------------
+METHOD write_enhs.
+DATA lt_out TYPE ty_str_lines.
+h1( EXPORTING iv_type = 'ENHANCEMENT SPOT' iv_name = |{ iv_name }| CHANGING ct_out = lt_out ).
+TRY.
+DATA(lo_spot) = cl_enh_factory=>get_enhancement_spot( spot_name = CONV enhspotname( iv_name ) ).
+DATA(lt_badi) = lo_spot->get_badi_definitions( ).
+IF lt_badi IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* BADI DEFINITIONS:' TO lt_out.
+LOOP AT lt_badi INTO DATA(ls_b).
+sep( CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'BAdI Name' iv_value = |{ ls_b-badi_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Description' iv_value = |{ ls_b-short_text }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Interface' iv_value = |{ ls_b-interface_name }| CHANGING ct_out = lt_out ).
+attr( EXPORTING iv_label = 'Multi-use' iv_value = |{ ls_b-multiple_use }| CHANGING ct_out = lt_out ).
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+ENDIF.
+DATA(lt_hooks) = lo_spot->get_hook_spots( ).
+IF lt_hooks IS NOT INITIAL.
+blank( CHANGING ct_out = lt_out ).
+APPEND '* HOOK SPOTS:' TO lt_out.
+sep( CHANGING ct_out = lt_out ).
+LOOP AT lt_hooks INTO DATA(ls_h).
+APPEND |* { ls_h-hook_name }| TO lt_out.
+ENDLOOP.
+sep( CHANGING ct_out = lt_out ).
+ENDIF.
+CATCH cx_enh_root INTO DATA(lx).
+APPEND |* Could not read spot details: { lx->get_text( ) }| TO lt_out.
+ENDTRY.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.enhs.txt' it_lines = lt_out ).
+ENDMETHOD.
+"--------------------------------------------------------------------------
+" DDLS / DDLX / DCLS - Core Data Services Source (S/4HANA centric)
+"--------------------------------------------------------------------------
+METHOD write_ddls.
+DATA lt_out TYPE ty_str_lines.
+SELECT SINGLE source FROM dddlsvrc INTO @DATA(lv_src) WHERE ddlname = @iv_name AND as4local = 'A'.
+IF sy-subrc = 0.
+APPEND lv_src TO lt_out.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.ddls.asddls' it_lines = lt_out ).
+ENDIF.
+ENDMETHOD.
+METHOD write_ddlx.
+DATA lt_out TYPE ty_str_lines.
+SELECT SINGLE source FROM dddlxsvrc INTO @DATA(lv_src) WHERE ddlxname = @iv_name AND as4local = 'A'.
+IF sy-subrc = 0.
+APPEND lv_src TO lt_out.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.ddlx.asddlxs' it_lines = lt_out ).
+ENDIF.
+ENDMETHOD.
+METHOD write_dcls.
+DATA lt_out TYPE ty_str_lines.
+SELECT SINGLE source FROM ddclsvrc INTO @DATA(lv_src) WHERE dclname = @iv_name AND as4local = 'A'.
+IF sy-subrc = 0.
+APPEND lv_src TO lt_out.
+lcl_file_writer=>write_lines( iv_path = iv_dir && iv_name && '.dcls.as dcls' it_lines = lt_out ).
+ENDIF.
+ENDMETHOD.
 ENDCLASS.
-
-CLASS lcl_exporter DEFINITION.
-  PUBLIC SECTION.
-    METHODS constructor
-      IMPORTING io_zip    TYPE REF TO lcl_zip_writer
-                io_source TYPE REF TO lcl_source_reader
-                io_ddic   TYPE REF TO lcl_ddic_exporter
-                io_log    TYPE REF TO lcl_logger.
-    METHODS export_object
-      IMPORTING is_tadir TYPE ty_tadir.
-  PRIVATE SECTION.
-    DATA mo_zip    TYPE REF TO lcl_zip_writer.
-    DATA mo_source TYPE REF TO lcl_source_reader.
-    DATA mo_ddic   TYPE REF TO lcl_ddic_exporter.
-    DATA mo_log    TYPE REF TO lcl_logger.
-
-    METHODS export_prog
-      IMPORTING iv_prog TYPE progname.
-    METHODS export_class
-      IMPORTING iv_class TYPE seoclsname.
-    METHODS export_fugr
-      IMPORTING iv_fugr TYPE rs38l_area.
-    METHODS export_table
-      IMPORTING iv_tabname TYPE tabname.
-    METHODS export_view
-      IMPORTING iv_viewname TYPE tabname.
-    METHODS add_report_to_zip
-      IMPORTING iv_report   TYPE progname
-                iv_zip_name TYPE string
-      RETURNING VALUE(rv_found) TYPE abap_bool.
+*----------------------------------------------------------------------*
+* CLASS: LCL_PACKAGE_COLLECTOR
+* Walks TDEVC recursively to discover all subpackages,
+* then bulk-fetches TADIR objects in one FOR ALL ENTRIES SELECT.
+*----------------------------------------------------------------------*
+CLASS lcl_package_collector DEFINITION FINAL.
+PUBLIC SECTION.
+TYPES tt_devclass TYPE STANDARD TABLE OF devclass WITH DEFAULT KEY.
+METHODS constructor IMPORTING iv_root TYPE devclass.
+METHODS collect RAISING lcx_export_error.
+METHODS get_objects_for IMPORTING iv_pack TYPE devclass RETURNING VALUE(rt_objs) TYPE tt_tadir_obj.
+METHODS get_children_of IMPORTING iv_pack TYPE devclass RETURNING VALUE(rt_packs) TYPE tt_devclass.
+METHODS get_total_count RETURNING VALUE(rv_n) TYPE i.
+PRIVATE SECTION.
+DATA mv_root TYPE devclass.
+DATA mt_packs TYPE tt_devclass.
+DATA mt_objects TYPE tt_tadir_obj.
+METHODS recurse IMPORTING iv_pack TYPE devclass.
 ENDCLASS.
-
+CLASS lcl_package_collector IMPLEMENTATION.
+METHOD constructor.
+mv_root = iv_root.
+ENDMETHOD.
+METHOD collect.
+" Validate root package exists
+SELECT SINGLE devclass FROM tdevc INTO @DATA(lv_chk) WHERE devclass = @mv_root.
+IF sy-subrc <> 0.
+RAISE EXCEPTION TYPE lcx_export_error EXPORTING iv_msg = |Package '{ mv_root }' not found in TDEVC|.
+ENDIF.
+APPEND mv_root TO mt_packs.
+recurse( mv_root ).
+" One SELECT for all objects across all collected packages
+SELECT pgmid, object, obj_name, devclass FROM tadir INTO TABLE @mt_objects FOR ALL ENTRIES IN @mt_packs WHERE devclass = @mt_packs-table_line AND pgmid = 'R3TR' AND delflag = space.
+SORT mt_objects BY devclass object obj_name.
+ENDMETHOD.
+METHOD recurse.
+SELECT devclass FROM tdevc INTO TABLE @DATA(lt_children) WHERE parentcl = @iv_pack.
+LOOP AT lt_children INTO DATA(lv_child).
+IF NOT line_exists( mt_packs[ table_line = lv_child ] ).
+APPEND lv_child TO mt_packs.
+recurse( lv_child ).
+ENDIF.
+ENDLOOP.
+ENDMETHOD.
+METHOD get_objects_for.
+rt_objs = FILTER #( mt_objects USING KEY primary_key WHERE devclass = iv_pack ).
+ENDMETHOD.
+METHOD get_children_of.
+SELECT devclass FROM tdevc INTO TABLE @rt_packs WHERE parentcl = @iv_pack.
+ENDMETHOD.
+METHOD get_total_count.
+rv_n = lines( mt_objects ).
+ENDMETHOD.
+ENDCLASS.
+*----------------------------------------------------------------------*
+* CLASS: LCL_EXPORTER (Orchestrator)
+*----------------------------------------------------------------------*
+CLASS lcl_exporter DEFINITION FINAL.
+PUBLIC SECTION.
+METHODS constructor IMPORTING iv_pack TYPE devclass iv_path TYPE string.
+METHODS run RAISING lcx_export_error.
+PRIVATE SECTION.
+DATA mv_pack TYPE devclass.
+DATA mv_base TYPE string. " normalised base path (trailing \)
+DATA mo_coll TYPE REF TO lcl_package_collector.
+DATA mv_done TYPE i.
+DATA mv_total TYPE i.
+METHODS process_package IMPORTING iv_pack TYPE devclass iv_folder TYPE string. " full path to this package's folder
+METHODS process_object IMPORTING is_obj TYPE ty_tadir_obj iv_src TYPE string. " full path to src\ folder
+METHODS write_devc IMPORTING iv_pack TYPE devclass iv_folder TYPE string.
+METHODS tick IMPORTING iv_text TYPE string.
+ENDCLASS.
 CLASS lcl_exporter IMPLEMENTATION.
-  METHOD constructor.
-    mo_zip    = io_zip.
-    mo_source = io_source.
-    mo_ddic   = io_ddic.
-    mo_log    = io_log.
-  ENDMETHOD.
-
-  METHOD add_report_to_zip.
-    DATA lt_source TYPE tt_source.
-    DATA lv_found  TYPE abap_bool.
-    DATA lv_text   TYPE string.
-
-    CLEAR rv_found.
-
-    mo_source->read_report_safe(
-      EXPORTING
-        iv_prog   = iv_report
-      IMPORTING
-        et_source = lt_source
-        ev_found  = lv_found ).
-
-    IF lv_found IS INITIAL.
-      RETURN.
-    ENDIF.
-
-    lv_text = lcl_text=>source_to_string( lt_source ).
-
-    IF lv_text IS INITIAL.
-      RETURN.
-    ENDIF.
-
-    mo_zip->add_file(
-      iv_name    = iv_zip_name
-      iv_content = lv_text ).
-
-    rv_found = abap_true.
-  ENDMETHOD.
-
-  METHOD export_prog.
-    DATA lt_includes TYPE tt_progname.
-    DATA lv_include  TYPE progname.
-    DATA lv_zip_name TYPE string.
-    DATA lv_count    TYPE i.
-    DATA lv_found    TYPE abap_bool.
-
-    CLEAR lv_count.
-
-    CONCATENATE 'src/prog/' iv_prog '/main.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = iv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ELSE.
-      mo_log->add_warning(
-        iv_object  = 'PROG'
-        iv_name    = iv_prog
-        iv_message = 'Main program source not found' ).
-    ENDIF.
-
-    lt_includes = mo_source->get_all_includes( iv_prog ).
-
-    LOOP AT lt_includes INTO lv_include.
-      CLEAR lv_zip_name.
-      CONCATENATE 'src/prog/' iv_prog '/includes/' lv_include '.abap'
-             INTO lv_zip_name.
-
-      lv_found = add_report_to_zip(
-        iv_report   = lv_include
-        iv_zip_name = lv_zip_name ).
-
-      IF lv_found = abap_true.
-        lv_count = lv_count + 1.
-      ELSE.
-        mo_log->add_warning(
-          iv_object  = 'PROG'
-          iv_name    = iv_prog
-          iv_message = 'Include listed but source not readable' ).
-      ENDIF.
-    ENDLOOP.
-
-    IF lv_count > 0.
-      mo_log->add_success(
-        iv_object  = 'PROG'
-        iv_name    = iv_prog
-        iv_message = 'Program exported' ).
-    ELSE.
-      mo_log->add_error(
-        iv_object  = 'PROG'
-        iv_name    = iv_prog
-        iv_message = 'No program content exported' ).
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD export_class.
-    DATA lv_prog     TYPE progname.
-    DATA lv_zip_name TYPE string.
-    DATA lv_count    TYPE i.
-    DATA lv_found    TYPE abap_bool.
-
-    CLEAR lv_count.
-
-    lv_prog = mo_source->build_class_part_program(
-      iv_class  = iv_class
-      iv_suffix = 'CP' ).
-    CONCATENATE 'src/clas/' iv_class '/cp.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = lv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ENDIF.
-
-    lv_prog = mo_source->build_class_part_program(
-      iv_class  = iv_class
-      iv_suffix = 'CCDEF' ).
-    CONCATENATE 'src/clas/' iv_class '/ccdef.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = lv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ENDIF.
-
-    lv_prog = mo_source->build_class_part_program(
-      iv_class  = iv_class
-      iv_suffix = 'CCIMP' ).
-    CONCATENATE 'src/clas/' iv_class '/ccimp.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = lv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ENDIF.
-
-    lv_prog = mo_source->build_class_part_program(
-      iv_class  = iv_class
-      iv_suffix = 'CCMAC' ).
-    CONCATENATE 'src/clas/' iv_class '/ccmac.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = lv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ENDIF.
-
-    lv_prog = mo_source->build_class_part_program(
-      iv_class  = iv_class
-      iv_suffix = 'CCAU' ).
-    CONCATENATE 'src/clas/' iv_class '/ccau.abap' INTO lv_zip_name.
-    lv_found = add_report_to_zip(
-      iv_report   = lv_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ENDIF.
-
-    IF lv_count > 0.
-      mo_log->add_success(
-        iv_object  = 'CLAS'
-        iv_name    = iv_class
-        iv_message = 'Class exported' ).
-    ELSE.
-      mo_log->add_error(
-        iv_object  = 'CLAS'
-        iv_name    = iv_class
-        iv_message = 'No class pool parts exported' ).
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD export_fugr.
-    DATA lv_main_prog TYPE progname.
-    DATA lt_includes  TYPE tt_progname.
-    DATA lv_include   TYPE progname.
-    DATA lt_enlfdir   TYPE tt_enlfdir.
-    DATA ls_enlfdir   TYPE ty_enlfdir.
-    DATA lv_zip_name  TYPE string.
-    DATA lv_text      TYPE string.
-    DATA lv_line      TYPE string.
-    DATA lv_count     TYPE i.
-    DATA lv_found     TYPE abap_bool.
-
-    CLEAR lv_count.
-
-    CONCATENATE 'SAPL' iv_fugr INTO lv_main_prog.
-    CONCATENATE 'src/fugr/' iv_fugr '/main.abap' INTO lv_zip_name.
-
-    lv_found = add_report_to_zip(
-      iv_report   = lv_main_prog
-      iv_zip_name = lv_zip_name ).
-    IF lv_found = abap_true.
-      lv_count = lv_count + 1.
-    ELSE.
-      mo_log->add_warning(
-        iv_object  = 'FUGR'
-        iv_name    = iv_fugr
-        iv_message = 'Main function group program not found' ).
-    ENDIF.
-
-    lt_includes = mo_source->get_all_includes( lv_main_prog ).
-
-    LOOP AT lt_includes INTO lv_include.
-      CLEAR lv_zip_name.
-      CONCATENATE 'src/fugr/' iv_fugr '/includes/' lv_include '.abap'
-             INTO lv_zip_name.
-
-      lv_found = add_report_to_zip(
-        iv_report   = lv_include
-        iv_zip_name = lv_zip_name ).
-
-      IF lv_found = abap_true.
-        lv_count = lv_count + 1.
-      ENDIF.
-    ENDLOOP.
-
-    CLEAR lt_enlfdir.
-    SELECT funcname
-      FROM enlfdir
-      INTO TABLE lt_enlfdir
-      WHERE area = iv_fugr.
-
-    IF sy-subrc = 0 AND lt_enlfdir IS NOT INITIAL.
-      SORT lt_enlfdir BY funcname.
-      CLEAR lv_text.
-      lcl_text=>append_line(
-        EXPORTING
-          iv_line = 'FUNCTION MODULES:'
-        CHANGING
-          cv_text = lv_text ).
-
-      LOOP AT lt_enlfdir INTO ls_enlfdir.
-        CLEAR lv_line.
-        lv_line = ls_enlfdir-funcname.
-        lcl_text=>append_line(
-          EXPORTING
-            iv_line = lv_line
-          CHANGING
-            cv_text = lv_text ).
-      ENDLOOP.
-
-      CONCATENATE 'src/fugr/' iv_fugr '/function_modules.txt'
-             INTO lv_zip_name.
-      mo_zip->add_file(
-        iv_name    = lv_zip_name
-        iv_content = lv_text ).
-    ENDIF.
-
-    IF lv_count > 0.
-      mo_log->add_success(
-        iv_object  = 'FUGR'
-        iv_name    = iv_fugr
-        iv_message = 'Function group exported' ).
-    ELSE.
-      mo_log->add_error(
-        iv_object  = 'FUGR'
-        iv_name    = iv_fugr
-        iv_message = 'No function group source exported' ).
-    ENDIF.
-  ENDMETHOD.
-
-  METHOD export_table.
-    DATA lv_text  TYPE string.
-    DATA lv_found TYPE abap_bool.
-    DATA lv_zip_name TYPE string.
-
-    mo_ddic->get_table_text(
-      EXPORTING
-        iv_tabname = iv_tabname
-      IMPORTING
-        ev_text    = lv_text
-        ev_found   = lv_found ).
-
-    IF lv_found IS INITIAL.
-      mo_log->add_error(
-        iv_object  = 'TABL'
-        iv_name    = iv_tabname
-        iv_message = 'DDIC table metadata not found' ).
-      RETURN.
-    ENDIF.
-
-    CONCATENATE 'src/ddic/tabl/' iv_tabname '.txt' INTO lv_zip_name.
-    mo_zip->add_file(
-      iv_name    = lv_zip_name
-      iv_content = lv_text ).
-
-    mo_log->add_success(
-      iv_object  = 'TABL'
-      iv_name    = iv_tabname
-      iv_message = 'DDIC table exported' ).
-  ENDMETHOD.
-
-  METHOD export_view.
-    DATA lv_text  TYPE string.
-    DATA lv_found TYPE abap_bool.
-    DATA lv_zip_name TYPE string.
-
-    mo_ddic->get_view_text(
-      EXPORTING
-        iv_viewname = iv_viewname
-      IMPORTING
-        ev_text     = lv_text
-        ev_found    = lv_found ).
-
-    IF lv_found IS INITIAL.
-      mo_log->add_error(
-        iv_object  = 'VIEW'
-        iv_name    = iv_viewname
-        iv_message = 'DDIC view metadata not found' ).
-      RETURN.
-    ENDIF.
-
-    CONCATENATE 'src/ddic/view/' iv_viewname '.txt' INTO lv_zip_name.
-    mo_zip->add_file(
-      iv_name    = lv_zip_name
-      iv_content = lv_text ).
-
-    mo_log->add_success(
-      iv_object  = 'VIEW'
-      iv_name    = iv_viewname
-      iv_message = 'DDIC view exported' ).
-  ENDMETHOD.
-
-  METHOD export_object.
-    DATA lv_progname TYPE progname.
-    DATA lv_class    TYPE seoclsname.
-    DATA lv_fugr     TYPE rs38l_area.
-    DATA lv_tabname  TYPE tabname.
-    DATA lv_viewname TYPE tabname.
-
-    CASE is_tadir-object.
-      WHEN 'PROG'.
-        lv_progname = is_tadir-obj_name.
-        export_prog( lv_progname ).
-
-      WHEN 'CLAS'.
-        lv_class = is_tadir-obj_name.
-        export_class( lv_class ).
-
-      WHEN 'FUGR'.
-        lv_fugr = is_tadir-obj_name.
-        export_fugr( lv_fugr ).
-
-      WHEN 'TABL'.
-        lv_tabname = is_tadir-obj_name.
-        export_table( lv_tabname ).
-
-      WHEN 'VIEW'.
-        lv_viewname = is_tadir-obj_name.
-        export_view( lv_viewname ).
-
-      WHEN 'INTF' OR 'DDLS' OR 'ENHO' OR 'ENHS' OR 'SXSD' OR 'SXCI'.
-        mo_log->add_info(
-          iv_object  = is_tadir-object
-          iv_name    = is_tadir-obj_name
-          iv_message = 'Object type detected but not exported by this report version' ).
-
-      WHEN OTHERS.
-        mo_log->add_info(
-          iv_object  = is_tadir-object
-          iv_name    = is_tadir-obj_name
-          iv_message = 'Unsupported object type skipped' ).
-    ENDCASE.
-  ENDMETHOD.
+METHOD constructor.
+mv_pack = iv_pack.
+" Normalise: ensure trailing backslash
+mv_base = iv_path.
+IF mv_base+( strlen( mv_base ) - 1 )(1) <> '\'.
+mv_base = mv_base && '\'.
+ENDIF.
+CREATE OBJECT mo_coll EXPORTING iv_root = iv_pack.
+ENDMETHOD.
+METHOD tick.
+mv_done = mv_done + 1.
+cl_progress_indicator=>progress_indicate( i_text = iv_text i_processed = mv_done i_total = mv_total i_output_immediately = abap_true ).
+ENDMETHOD.
+METHOD run.
+WRITE: / |Collecting package tree for { mv_pack }...|.
+mo_coll->collect( ).
+mv_total = mo_coll->get_total_count( ).
+WRITE: / |Found { mv_total } objects. Writing to { mv_base }{ mv_pack }\|.
+process_package( iv_pack = mv_pack iv_folder = mv_base && mv_pack && '\' ).
+SKIP.
+WRITE: / |=== Export complete: { mv_done } of { mv_total } objects written ===|.
+WRITE: / |Folder : { mv_base }{ mv_pack }\|.
+WRITE: / |Ready : cd to folder and run git init then git remote add origin <url> then git push|.
+ENDMETHOD.
+METHOD write_devc.
+DATA lt_out TYPE ty_str_lines.
+SELECT SINGLE ctext, parentcl FROM tdevc INTO @DATA(ls_pkg) WHERE devclass = @iv_pack.
+APPEND |* ================================================================| TO lt_out.
+APPEND |* PACKAGE: { iv_pack }| TO lt_out.
+APPEND |* ================================================================| TO lt_out.
+APPEND |* Description : { ls_pkg-ctext }| TO lt_out.
+APPEND |* Parent Package : { ls_pkg-parentcl }| TO lt_out.
+APPEND |* Exported : { sy-datum DATE = ENVIRONMENT } { sy-uzeit TIME = ENVIRONMENT }| TO lt_out.
+APPEND |* System : { sy-sysid } / Client { sy-mandt }| TO lt_out.
+lcl_file_writer=>write_lines( iv_path = iv_folder && iv_pack && '.devc.txt' it_lines = lt_out ).
+ENDMETHOD.
+METHOD process_package.
+write_devc( iv_pack = iv_pack iv_folder = iv_folder ).
+DATA(lv_src) = iv_folder && 'src\'.
+LOOP AT mo_coll->get_objects_for( iv_pack ) INTO DATA(ls_obj).
+tick( |{ ls_obj-object } { ls_obj-obj_name }| ).
+TRY.
+process_object( is_obj = ls_obj iv_src = lv_src ).
+CATCH cx_root INTO DATA(lx).
+WRITE: / | WARNING { ls_obj-object } { ls_obj-obj_name }: { lx->get_text( ) }|.
+ENDTRY.
+ENDLOOP.
+" Recurse into direct child packages
+LOOP AT mo_coll->get_children_of( iv_pack ) INTO DATA(lv_child).
+process_package( iv_pack = lv_child iv_folder = iv_folder && lv_child && '\' ).
+ENDLOOP.
+ENDMETHOD.
+METHOD process_object.
+CASE is_obj-object.
+" -- Source-based objects --------------------------------------
+WHEN 'CLAS'.
+lcl_source_reader=>write_class( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'PROG'.
+lcl_source_reader=>write_prog( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'INTF'.
+lcl_source_reader=>write_intf( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'FUGR'.
+lcl_source_reader=>write_fugr( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'TYPE'.
+lcl_source_reader=>write_type( iv_name = is_obj-obj_name iv_dir = iv_src ).
+" -- DDIC objects ----------------------------------------------
+WHEN 'TABL'.
+lcl_ddic_reader=>write_tabl( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'DTEL'.
+lcl_ddic_reader=>write_dtel( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'DOMA'.
+lcl_ddic_reader=>write_doma( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'VIEW'.
+lcl_ddic_reader=>write_view( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'SHLP'.
+lcl_ddic_reader=>write_shlp( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'MSAG'.
+lcl_ddic_reader=>write_msag( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'ENHS'.
+lcl_ddic_reader=>write_enhs( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'DDLS'.
+lcl_ddic_reader=>write_ddls( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'DDLX'.
+lcl_ddic_reader=>write_ddlx( iv_name = is_obj-obj_name iv_dir = iv_src ).
+WHEN 'DCLS'.
+lcl_ddic_reader=>write_dcls( iv_name = is_obj-obj_name iv_dir = iv_src ).
+" -- Unsupported: write a stub so the object is not silently lost
+WHEN OTHERS.
+DATA lt_stub TYPE ty_str_lines.
+APPEND |* Object type { is_obj-object } not handled by this exporter.| TO lt_stub.
+APPEND |* Object name : { is_obj-obj_name }| TO lt_stub.
+APPEND |* Add a handler in LCL_SOURCE_READER or LCL_DDIC_READER.| TO lt_stub.
+lcl_file_writer=>write_lines( iv_path = iv_src && is_obj-obj_name && '.' && is_obj-object && '.txt' it_stub = lt_stub ).
+ENDCASE.
+ENDMETHOD.
 ENDCLASS.
-
+*----------------------------------------------------------------------*
+* SELECTION SCREEN EVENTS
+*----------------------------------------------------------------------*
+AT SELECTION-SCREEN ON p_pack.
+SELECT SINGLE devclass FROM tdevc INTO @DATA(lv_exists) WHERE devclass = @p_pack.
+IF sy-subrc <> 0.
+MESSAGE |Package '{ p_pack }' does not exist in this system.| TYPE 'E'.
+ENDIF.
+AT SELECTION-SCREEN ON p_path.
+IF p_path IS INITIAL.
+MESSAGE 'Please enter a local destination path.' TYPE 'E'.
+ENDIF.
+*----------------------------------------------------------------------*
+* START-OF-SELECTION
+*----------------------------------------------------------------------*
 START-OF-SELECTION.
-
-  DATA lt_tadir TYPE tt_tadir.
-  DATA ls_tadir TYPE ty_tadir.
-  DATA lo_zip TYPE REF TO lcl_zip_writer.
-  DATA lo_source TYPE REF TO lcl_source_reader.
-  DATA lo_ddic TYPE REF TO lcl_ddic_exporter.
-  DATA lo_log TYPE REF TO lcl_logger.
-  DATA lo_exporter TYPE REF TO lcl_exporter.
-  DATA lv_zip TYPE xstring.
-  DATA lt_bin TYPE STANDARD TABLE OF x255 WITH DEFAULT KEY.
-  DATA lv_size TYPE i.
-  DATA lv_total TYPE i.
-  DATA lv_index TYPE i.
-  DATA lv_pct TYPE i.
-  DATA lv_text TYPE string.
-  DATA lv_index_text TYPE string.
-  DATA lv_total_text TYPE string.
-
-  CREATE OBJECT lo_zip.
-  CREATE OBJECT lo_source.
-  CREATE OBJECT lo_ddic.
-  CREATE OBJECT lo_log.
-  CREATE OBJECT lo_exporter
-    EXPORTING
-      io_zip    = lo_zip
-      io_source = lo_source
-      io_ddic   = lo_ddic
-      io_log    = lo_log.
-
-  SELECT object obj_name
-    FROM tadir
-    INTO TABLE lt_tadir
-    WHERE pgmid    = 'R3TR'
-      AND devclass = p_pack
-    ORDER BY object obj_name.
-
-  IF lt_tadir IS INITIAL.
-    WRITE: / 'No repository objects found for package', p_pack.
-    RETURN.
-  ENDIF.
-
-  DESCRIBE TABLE lt_tadir LINES lv_total.
-
-  LOOP AT lt_tadir INTO ls_tadir.
-    lv_index = sy-tabix.
-
-    IF lv_total > 0.
-      lv_pct = lv_index * 100 / lv_total.
-      WRITE lv_index TO lv_index_text.
-      WRITE lv_total TO lv_total_text.
-      CLEAR lv_text.
-      CONCATENATE 'Exporting'
-                  ls_tadir-object
-                  ls_tadir-obj_name
-                  '('
-                  lv_index_text
-                  '/'
-                  lv_total_text
-                  ')'
-             INTO lv_text
-             SEPARATED BY space.
-
-      CALL FUNCTION 'SAPGUI_PROGRESS_INDICATOR'
-        EXPORTING
-          percentage = lv_pct
-          text       = lv_text
-        EXCEPTIONS
-          OTHERS     = 1.
-    ENDIF.
-
-    lo_exporter->export_object( ls_tadir ).
-  ENDLOOP.
-
-  lo_zip->add_file(
-    iv_name    = 'logs/export_log.txt'
-    iv_content = lo_log->to_string( ) ).
-
-  lo_zip->add_file(
-    iv_name    = 'logs/export_summary.txt'
-    iv_content = lo_log->summary_to_string( ) ).
-
-  lv_zip = lo_zip->get_zip( ).
-
-  IF lv_zip IS INITIAL.
-    WRITE: / 'No content to export'.
-    WRITE: / lo_log->summary_to_string( ).
-    RETURN.
-  ENDIF.
-
-  CALL FUNCTION 'SCMS_XSTRING_TO_BINARY'
-    EXPORTING
-      buffer     = lv_zip
-    TABLES
-      binary_tab = lt_bin
-    EXCEPTIONS
-      failed     = 1
-      OTHERS     = 2.
-
-  IF sy-subrc <> 0.
-    WRITE: / 'Failed to convert ZIP to binary'.
-    RETURN.
-  ENDIF.
-
-  lv_size = xstrlen( lv_zip ).
-
-  CALL FUNCTION 'GUI_DOWNLOAD'
-    EXPORTING
-      filename     = p_path
-      filetype     = 'BIN'
-      bin_filesize = lv_size
-    TABLES
-      data_tab     = lt_bin
-    EXCEPTIONS
-      file_write_error        = 1
-      no_batch                = 2
-      gui_refuse_filetransfer = 3
-      invalid_type            = 4
-      no_authority            = 5
-      unknown_error           = 6
-      header_not_allowed      = 7
-      separator_not_allowed   = 8
-      filesize_not_allowed    = 9
-      header_too_long         = 10
-      dp_error_create         = 11
-      dp_error_send           = 12
-      dp_error_write          = 13
-      unknown_dp_error        = 14
-      access_denied           = 15
-      dp_out_of_memory        = 16
-      disk_full               = 17
-      dp_timeout              = 18
-      file_not_found          = 19
-      dataprovider_exception  = 20
-      control_flush_error     = 21
-      OTHERS                  = 22.
-
-  IF sy-subrc <> 0.
-    WRITE: / 'ZIP created but download failed. Target path:', p_path.
-    WRITE: / lo_log->summary_to_string( ).
-    RETURN.
-  ENDIF.
-
-  WRITE: / 'Export completed successfully'.
-  WRITE: / 'ZIP file:', p_path.
-  WRITE: / lo_log->summary_to_string( ).
+TRY.
+NEW lcl_exporter( iv_pack = p_pack iv_path = p_path )->run( ).
+CATCH lcx_export_error INTO DATA(lx).
+MESSAGE lx->get_text( ) TYPE 'E'.
+ENDTRY.
